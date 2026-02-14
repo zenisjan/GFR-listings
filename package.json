@@ -1,0 +1,46 @@
+{
+  "name": "czech-government-auction-scraper",
+  "version": "1.0.0",
+  "description": "Apify Actor for scraping Czech government auction listings from drazby.fs.gov.cz",
+  "main": "src/main.py",
+  "scripts": {
+    "start": "python src/main.py",
+    "test": "python -m pytest tests/",
+    "lint": "flake8 src/",
+    "format": "black src/"
+  },
+  "keywords": [
+    "apify",
+    "actor",
+    "scraper",
+    "czech",
+    "government",
+    "auction",
+    "drazby"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "apify": "^3.0.0"
+  },
+  "devDependencies": {
+    "pytest": "^7.0.0",
+    "flake8": "^6.0.0",
+    "black": "^23.0.0"
+  },
+  "apify": {
+    "actorSpecification": 1,
+    "name": "czech-government-auction-scraper",
+    "title": "Czech Government Auction Scraper",
+    "description": "Scrapes auction listings from the Czech government auction website (drazby.fs.gov.cz)",
+    "version": "1.0.0",
+    "defaultRunOptions": {
+      "timeoutSecs": 3600,
+      "memoryMbytes": 2048
+    },
+    "dockerfile": "Dockerfile",
+    "dockerContextDir": ".",
+    "input": ".actor/input_schema.json",
+    "templateId": "python"
+  }
+}

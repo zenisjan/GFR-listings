@@ -1,0 +1,7 @@
+{
+    "actorSpecification": 1,
+    "name": "gfr-scraper",
+    "title": "GFR Scraper",
+    "description": "Scrapes auction listings from the GFR website",
+    "version": "0.0"
+}

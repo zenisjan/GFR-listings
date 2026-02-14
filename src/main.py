@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""
+Optimized Czech Government Auction Scraper
+==========================================
+
+This scraper directly calls the API endpoint to get all auction data at once,
+eliminating the need for browser automation and complex pagination logic.
+
+The API provides comprehensive auction data including:
+- All auction details (title, description, price, location, dates)
+- Contact information
+- Images
+- Auction status and metadata
+
+This optimized version:
+- Uses only HTTP requests (no Playwright)
+- Single API call gets all data
+- Applies filters after fetching data
+- Much faster and more reliable
+"""
+
+import asyncio
+import json
+import os
+import re
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+import httpx
+from apify import Actor
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
+
+try:
+    from .czech_cities import geocode_czech_city
+except ImportError:
+    from czech_cities import geocode_czech_city
+
+
+class OptimizedGovernmentAuctionScraper:
+    """Optimized scraper that uses browser for session establishment and HTTP for API calls."""
+    
+    def __init__(self, client: httpx.AsyncClient):
+        self.client = client
+        self.api_url = "https://drazby.fs.gov.cz/api/v02/as/data/Predmet_drazby"
+        self.main_url = "https://drazby.fs.gov.cz/client/main"
+        self.browser = None
+        self.playwright = None
+        
+    async def scrape_all_auctions(
+        self,
+        max_listings: int = 0,
+        auction_status: str = "active",
+        price_min: int = 0,
+        price_max: int = 0,
+        location: Optional[str] = None,
+        search_query: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Scrape all auctions from the API and apply filters.
+        
+        Args:
+            max_listings: Maximum number of listings to return (0 = all)
+            auction_status: Filter by status ("all", "active", "ended")
+            price_min: Minimum price filter in CZK
+            price_max: Maximum price filter in CZK
+            location: Location filter (city/region)
+            search_query: Search term to filter titles/descriptions
+            
+        Returns:
+            List of auction dictionaries
+        """
+        try:
+            # Step 1: Establish session by visiting main page
+            Actor.log.info("🔗 Establishing session with the website...")
+            session_cookies = await self._establish_session()
+            
+            if not session_cookies:
+                Actor.log.error("❌ Failed to establish session")
+                return []
+            
+            # Step 2: Call API to get all auction data
+            Actor.log.info("📡 Fetching all auction data from API...")
+            all_auctions = await self._fetch_all_auctions(session_cookies)
+            
+            if not all_auctions:
+                Actor.log.warning("⚠️ No auction data received from API")
+                return []
+            
+            Actor.log.info(f"✅ Successfully fetched {len(all_auctions)} total auctions from API")
+            
+            # Step 3: Apply filters
+            Actor.log.info("🔍 Applying filters to auction data...")
+            filtered_auctions = self._apply_filters(
+                all_auctions, auction_status, price_min, price_max, location, search_query
+            )
+            
+            Actor.log.info(f"📊 After filtering: {len(filtered_auctions)} auctions match criteria")
+            
+            # Step 4: Limit results if requested
+            if max_listings > 0 and len(filtered_auctions) > max_listings:
+                filtered_auctions = filtered_auctions[:max_listings]
+                Actor.log.info(f"✂️ Limited to {max_listings} auctions as requested")
+            
+            # Step 5: Convert to standardized format
+            Actor.log.info("🔄 Converting to standardized format...")
+            standardized_auctions = []
+            for auction_data in filtered_auctions:
+                standardized = self._convert_to_standard_format(auction_data)
+                if standardized:
+                    standardized_auctions.append(standardized)
+            
+            Actor.log.info(f"🎯 Final result: {len(standardized_auctions)} auctions ready for storage")
+            return standardized_auctions
+            
+        except Exception as e:
+            Actor.log.error(f"❌ Error in scrape_all_auctions: {e}")
+            return []
+    
+    async def initialize_browser(self):
+        """Initialize browser for session establishment."""
+        try:
+            self.playwright = await async_playwright().start()
+            self.browser = await self.playwright.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-web-security']
+            )
+            Actor.log.info("✅ Browser initialized successfully")
+        except Exception as e:
+            Actor.log.error(f"❌ Failed to initialize browser: {e}")
+            raise
+    
+    async def close_browser(self):
+        """Close browser if it was initialized."""
+        if self.browser:
+            try:
+                await self.browser.close()
+                await self.playwright.stop()
+                Actor.log.info("✅ Browser closed successfully")
+            except Exception as e:
+                Actor.log.warning(f"⚠️ Error closing browser: {e}")
+    
+    async def _establish_session(self) -> Dict[str, str]:
+        """Establish a session using browser automation to get proper cookies."""
+        try:
+            if not self.browser:
+                await self.initialize_browser()
+            
+            page = await self.browser.new_page()
+            
+            # Set user agent
+            await page.set_extra_http_headers({
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            })
+            
+            # Navigate to main page to establish session
+            await page.goto(self.main_url, wait_until='networkidle')
+            await page.wait_for_timeout(2000)  # Wait for any JavaScript to run
+            
+            # Get session cookies
+            cookies = await page.context.cookies()
+            cookie_dict = {cookie['name']: cookie['value'] for cookie in cookies}
+            
+            await page.close()
+            
+            Actor.log.info(f"🍪 Established session with {len(cookie_dict)} cookies via browser")
+            return cookie_dict
+            
+        except Exception as e:
+            Actor.log.error(f"❌ Failed to establish session: {e}")
+            return {}
+    
+    async def _fetch_all_auctions(self, cookies: Dict[str, str]) -> List[Dict[str, Any]]:
+        """Fetch all auction data from the API."""
+        try:
+            response = await self.client.get(self.api_url, cookies=cookies)
+            response.raise_for_status()
+            
+            # Parse JSON response
+            data = response.json()
+            
+            if isinstance(data, list):
+                Actor.log.info(f"📦 API returned {len(data)} auction records")
+                return data
+            else:
+                Actor.log.warning(f"⚠️ Unexpected API response format: {type(data)}")
+                return []
+                
+        except Exception as e:
+            Actor.log.error(f"❌ Failed to fetch auctions from API: {e}")
+            return []
+    
+    def _apply_filters(
+        self,
+        auctions: List[Dict[str, Any]],
+        auction_status: str,
+        price_min: int,
+        price_max: int,
+        location: Optional[str],
+        search_query: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        """Apply filters to the auction data."""
+        filtered = auctions.copy()
+        
+        # Filter by auction status
+        if auction_status == "active":
+            filtered = [a for a in filtered if not a.get('Priklepnuto', True)]
+            Actor.log.info(f"🟢 Filtered to active auctions: {len(filtered)} remaining")
+        elif auction_status == "ended":
+            filtered = [a for a in filtered if a.get('Priklepnuto', False)]
+            Actor.log.info(f"🔴 Filtered to ended auctions: {len(filtered)} remaining")
+        # "all" means no status filtering
+        
+        # Filter by price range
+        if price_min > 0 or price_max > 0:
+            price_filtered = []
+            for auction in filtered:
+                price = auction.get('Akt_hod_prihozu', 0)
+                if isinstance(price, (int, float)):
+                    if price_min > 0 and price < price_min:
+                        continue
+                    if price_max > 0 and price > price_max:
+                        continue
+                    price_filtered.append(auction)
+            filtered = price_filtered
+            Actor.log.info(f"💰 Price filtered: {len(filtered)} remaining")
+        
+        # Filter by location
+        if location and location.strip():
+            location_lower = location.lower().strip()
+            location_filtered = []
+            for auction in filtered:
+                auction_location = auction.get('Mesto_prevzeti', '').lower()
+                if location_lower in auction_location:
+                    location_filtered.append(auction)
+            filtered = location_filtered
+            Actor.log.info(f"📍 Location filtered: {len(filtered)} remaining")
+        
+        # Filter by search query
+        if search_query and search_query.strip():
+            query_lower = search_query.lower().strip()
+            search_filtered = []
+            for auction in filtered:
+                title = auction.get('Nazev', '').lower()
+                description = auction.get('Popis', '').lower()
+                if query_lower in title or query_lower in description:
+                    search_filtered.append(auction)
+            filtered = search_filtered
+            Actor.log.info(f"🔍 Search filtered: {len(filtered)} remaining")
+        
+        return filtered
+    
+    def _geocode_location(self, location: str) -> Optional[float]:
+        """Return latitude for a Czech city name, or None."""
+        if not location:
+            return None
+        coords = geocode_czech_city(location.strip())
+        return coords[0] if coords else None
+
+    def _geocode_location_lng(self, location: str) -> Optional[float]:
+        """Return longitude for a Czech city name, or None."""
+        if not location:
+            return None
+        coords = geocode_czech_city(location.strip())
+        return coords[1] if coords else None
+
+    def _convert_to_standard_format(self, api_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Convert API data to standardized listing format."""
+        try:
+            # Extract auction ID
+            auction_id = str(api_data.get('ID', ''))
+            if not auction_id:
+                return None
+            
+            # Build auction URL
+            auction_url = f"https://drazby.fs.gov.cz/client/main#/auction/{auction_id}"
+            
+            # Extract basic information
+            title = api_data.get('Nazev', '')
+            price = api_data.get('Akt_hod_prihozu', 0)
+            location = api_data.get('Mesto_prevzeti', '')
+            description = api_data.get('Popis', '')
+            
+            # Extract dates
+            date_from = api_data.get('Datum_od_kdy', '')
+            date_to = api_data.get('Datum_do_kdy', '')
+            
+            # Extract image information
+            image_id = api_data.get('Hlavni_miniatura', '')
+            image_url = f"https://drazby.fs.gov.cz/api/v02/as/data/Hlavni_miniatura/{image_id}/Data" if image_id else ''
+            
+            # Extract additional auction details
+            auction_code = api_data.get('Kod', '')
+            minimal_bid = api_data.get('Minimalni_prihoz', 0)
+            estimated_value = api_data.get('Zjistena_cena', 0)
+            tax_rate = api_data.get('Sazba_dane', 0)
+            includes_vat = api_data.get('Vcetne_DPH', False)
+            
+            # Extract additional fields that might contain description
+            auction_type = api_data.get('Druh_dr', '')
+            condition = api_data.get('Stav', '')
+            notes = api_data.get('Poznamka', '')
+            
+            # Build comprehensive description
+            # Start with title as the main description if Popis is empty or just contains dates
+            if not description or 'Auction from' in description or len(description.strip()) < 10:
+                full_description = title
+            else:
+                full_description = description
+            
+            # Add auction code if available
+            if auction_code:
+                full_description = f"Kód: {auction_code}\n\n{full_description}"
+            
+            # Add auction type if available
+            if auction_type:
+                full_description += f"\n\nTyp dražby: {auction_type}"
+            
+            # Add condition if available
+            if condition:
+                full_description += f"\n\nStav: {condition}"
+            
+            # Add notes if available
+            if notes:
+                full_description += f"\n\nPoznámka: {notes}"
+            
+            # Add auction details
+            if minimal_bid > 0:
+                full_description += f"\n\nMinimální příhoz: {minimal_bid:,.0f} Kč"
+            if estimated_value > 0:
+                full_description += f"\n\nOdhadovaná hodnota: {estimated_value:,.0f} Kč"
+            if tax_rate > 0:
+                full_description += f"\n\nSazba DPH: {tax_rate}%"
+            if includes_vat:
+                full_description += "\n\nCena včetně DPH"
+            
+            # Add auction dates
+            if date_from:
+                full_description += f"\n\nZačátek dražby: {date_from}"
+            if date_to:
+                full_description += f"\n\nKonec dražby: {date_to}"
+            
+            # Build images array
+            images = []
+            if image_url:
+                images.append(image_url)
+            
+            # Determine auction status
+            is_knocked_down = api_data.get('Priklepnuto', False)
+            is_top = False  # Not available in API
+            
+            # Debug logging for full_description
+            if full_description:
+                Actor.log.debug(f"Created full_description for auction {auction_id}: {full_description[:100]}...")
+            else:
+                Actor.log.warning(f"Empty full_description for auction {auction_id}")
+            
+            return {
+                'id': auction_id,
+                'title': title,
+                'url': auction_url,
+                'category': 'government_auction',  # All are government auctions
+                'price': float(price) if isinstance(price, (int, float)) else 0.0,
+                'price_text': f"{price:,.0f} Kč" if price > 0 else '',
+                'description': title[:500] if title else (description[:500] if description else ''),  # Use title as description if available
+                'full_description': full_description,
+                'location': location,
+                'views': 0,  # Not available in API
+                'date': date_from,
+                'is_top': is_top,
+                'image_url': image_url,
+                'contact_name': '',  # Not available in API
+                'phone': '',  # Not available in API
+                'coordinates_lat': self._geocode_location(location),
+                'coordinates_lng': self._geocode_location_lng(location),
+                'images': json.dumps(images),
+                'similar_listings': json.dumps([]),
+                'scraped_at': datetime.now().isoformat(),
+                # Additional auction-specific fields
+                'auction_code': auction_code,
+                'minimal_bid': minimal_bid,
+                'estimated_value': estimated_value,
+                'is_knocked_down': is_knocked_down,
+                'date_from': date_from,
+                'date_to': date_to,
+                'tax_rate': tax_rate,
+                'includes_vat': includes_vat
+            }
+            
+        except Exception as e:
+            Actor.log.warning(f"⚠️ Error converting auction data: {e}")
+            return None
+
+
+async def main():
+    """Main function to run the optimized scraper."""
+    # Initialize the Actor
+    async with Actor:
+        Actor.log.info("🚀 Starting Optimized Czech Government Auction Scraper")
+        Actor.log.info("=" * 60)
+        
+        # Get input parameters
+        input_data = await Actor.get_input() or {}
+        
+        max_listings = input_data.get('maxListings', 0)
+        auction_status = input_data.get('auctionStatus', 'active')
+        price_min = input_data.get('priceMin', 0)
+        price_max = input_data.get('priceMax', 0)
+        location = input_data.get('location', '')
+        search_query = input_data.get('searchQuery', '')
+        
+        Actor.log.info(f"📋 Configuration:")
+        Actor.log.info(f"   Max listings: {max_listings if max_listings > 0 else 'unlimited'}")
+        Actor.log.info(f"   Auction status: {auction_status}")
+        Actor.log.info(f"   Price range: {price_min}-{price_max if price_max > 0 else 'unlimited'} CZK")
+        Actor.log.info(f"   Location filter: {location if location else 'none'}")
+        Actor.log.info(f"   Search query: {search_query if search_query else 'none'}")
+        
+        # Initialize database connection
+        db_manager_available = False
+        try:
+            from .database import db_manager
+
+            # Get scraper name from environment or use default
+            scraper_name = os.environ.get('SCRAPER_NAME', 'gfr')
+            db_manager.scraper_name = scraper_name
+
+            db_manager.initialize_pool()
+
+            # Create actor run record
+            actor_run_id = os.environ.get('APIFY_ACTOR_RUN_ID') or os.environ.get('ACTOR_RUN_ID', 'local-run')
+            actor_run_start = datetime.now()
+            db_manager.set_actor_run_info(actor_run_id, actor_run_start)
+            
+            db_manager.create_actor_run(
+                categories=['government_auction'],  # Single category since API provides all
+                max_listings=max_listings,
+                search_query=search_query,
+                location=location,
+                price_min=price_min,
+                price_max=price_max
+            )
+            
+            Actor.log.info("✅ Database connection established and actor run created")
+            db_manager_available = True
+            
+        except Exception as e:
+            Actor.log.error(f"❌ Failed to initialize database: {e}")
+            Actor.log.warning("⚠️ Continuing without database integration - data will be stored in Apify dataset only")
+            db_manager_available = False
+        
+        # Create HTTP client with proper headers
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'cs,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        }
+        
+        async with httpx.AsyncClient(headers=headers, timeout=30.0) as client:
+            scraper = OptimizedGovernmentAuctionScraper(client)
+            
+            try:
+                # Initialize browser for session establishment
+                await scraper.initialize_browser()
+                Actor.log.info("🌐 Browser initialized for session establishment")
+                
+                # Scrape all auctions
+                all_auctions = await scraper.scrape_all_auctions(
+                    max_listings=max_listings,
+                    auction_status=auction_status,
+                    price_min=price_min,
+                    price_max=price_max,
+                    location=location,
+                    search_query=search_query
+                )
+            finally:
+                # Always close browser
+                await scraper.close_browser()
+            
+            # Save data to both Apify dataset and database
+            if all_auctions:
+                # Save to Apify dataset (all auctions)
+                await Actor.push_data(all_auctions)
+                Actor.log.info(f"💾 Saved {len(all_auctions)} auctions to Apify dataset")
+                
+                # Save to database if available (only active auctions)
+                if db_manager_available:
+                    try:
+                        # Filter for database: only include active auctions (is_knocked_down: false)
+                        db_auctions = [auction for auction in all_auctions if not auction.get('is_knocked_down', True)]
+                        Actor.log.info(f"🔍 Filtering for database: {len(db_auctions)} active auctions out of {len(all_auctions)} total")
+                        
+                        if db_auctions:
+                            Actor.log.info("💾 Saving active auctions to database...")
+                            db_manager.insert_listings(db_auctions)
+                            Actor.log.info(f"✅ Saved {len(db_auctions)} active listings to database")
+                        else:
+                            Actor.log.info("ℹ️ No active auctions to save to database")
+                    except Exception as e:
+                        Actor.log.error(f"❌ Failed to save listings to database: {e}")
+                        # Try to refresh the connection pool and retry once
+                        try:
+                            Actor.log.info("🔄 Attempting to refresh connection pool and retry database operation")
+                            db_manager.refresh_pool()
+                            db_auctions = [auction for auction in all_auctions if not auction.get('is_knocked_down', True)]
+                            if db_auctions:
+                                db_manager.insert_listings(db_auctions)
+                                Actor.log.info(f"✅ Successfully saved {len(db_auctions)} active listings to database after retry")
+                        except Exception as retry_e:
+                            Actor.log.error(f"❌ Failed to save listings to database even after retry: {retry_e}")
+            else:
+                Actor.log.warning("⚠️ No auctions found matching the specified criteria")
+            
+            # Update actor run status in database
+            if db_manager_available:
+                try:
+                    db_manager.update_actor_run_status('completed', len(all_auctions))
+                    Actor.log.info("✅ Updated actor run status in database")
+                except Exception as e:
+                    Actor.log.error(f"❌ Failed to update actor run status: {e}")
+            
+            # Final summary
+            Actor.log.info("=" * 60)
+            Actor.log.info("🎉 SCRAPING COMPLETED SUCCESSFULLY")
+            Actor.log.info(f"📊 Total auctions scraped: {len(all_auctions)}")
+            if all_auctions and db_manager_available:
+                db_auctions_count = len([auction for auction in all_auctions if not auction.get('is_knocked_down', True)])
+                Actor.log.info(f"💾 Data saved to: Apify dataset ({len(all_auctions)} auctions) and database ({db_auctions_count} active auctions)")
+            else:
+                Actor.log.info(f"💾 Data saved to: {'Apify dataset' + (' and database' if db_manager_available else '')}")
+            Actor.log.info("=" * 60)
+
+
+if __name__ == '__main__':
+    asyncio.run(main())

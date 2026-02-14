@@ -1,0 +1,58 @@
+{
+    "title": "Czech Government Auction Scraper (Optimized)",
+    "type": "object", 
+    "schemaVersion": 1,
+    "properties": {
+        "maxListings": {
+            "title": "Maximum listings to scrape",
+            "type": "integer",
+            "description": "Maximum number of listings to scrape (0 = all available). The API provides all auctions at once, so this filters the results.",
+            "minimum": 0,
+            "default": 0
+        },
+        "auctionStatus": {
+            "title": "Auction status filter",
+            "type": "string",
+            "description": "Filter auctions by status. The API provides all auctions, so this filters the results.",
+            "editor": "select",
+            "enum": [
+                "all",
+                "active",
+                "ended"
+            ],
+            "enumTitles": [
+                "All Statuses (Active + Ended)",
+                "Active Auctions Only",
+                "Ended Auctions Only"
+            ],
+            "default": "active"
+        },
+        "priceMin": {
+            "title": "Minimum price filter (CZK)",
+            "type": "integer",
+            "description": "Minimum price filter in Czech Koruna. Applied after fetching all data from API.",
+            "minimum": 0,
+            "default": 0
+        },
+        "priceMax": {
+            "title": "Maximum price filter (CZK)", 
+            "type": "integer",
+            "description": "Maximum price filter in Czech Koruna. Applied after fetching all data from API.",
+            "minimum": 0,
+            "default": 0
+        },
+        "location": {
+            "title": "Location filter",
+            "type": "string", 
+            "description": "Optional location filter (city/region). Applied after fetching all data from API.",
+            "editor": "textfield"
+        },
+        "searchQuery": {
+            "title": "Search query filter",
+            "type": "string",
+            "description": "Optional search term to filter auction titles/descriptions. Applied after fetching all data from API.",
+            "editor": "textfield"
+        }
+    },
+    "required": []
+}

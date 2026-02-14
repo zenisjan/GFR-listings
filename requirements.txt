@@ -1,0 +1,11 @@
+# Core dependencies
+apify < 3.0.0
+httpx>=0.24.0
+beautifulsoup4[lxml]
+psycopg2-binary>=2.9.0
+
+# Browser automation (for session establishment)
+playwright>=1.40.0
+
+# Data processing
+python-dateutil>=2.8.0
