@@ -183,42 +183,23 @@ class DatabaseManager:
 
         with self.get_connection() as conn:
             with conn.cursor() as cursor:
-                # Check if run already exists (scheduler may have pre-created it)
-                if self.actor_run_uuid:
-                    cursor.execute(
-                        "SELECT id, scraper_id FROM actor_runs WHERE run_id = %s",
-                        (self.actor_run_uuid,)
-                    )
-                    existing = cursor.fetchone()
-                    if existing:
-                        self.actor_run_id = existing[0]
-                        # Inherit scraper_id from pre-created record if we don't have one
-                        if not self.scraper_id and existing[1]:
-                            self.scraper_id = existing[1]
-                        # Update the pre-created record with our details
-                        cursor.execute("""
-                            UPDATE actor_runs
-                            SET start_time = %s, categories = %s, max_listings = %s,
-                                search_query = %s, location_filter = %s,
-                                price_min = %s, price_max = %s, status = 'running'
-                            WHERE id = %s
-                        """, (
-                            self.actor_run_start, categories, max_listings,
-                            search_query, location, price_min, price_max,
-                            self.actor_run_id
-                        ))
-                        conn.commit()
-                        Actor.log.info(f"Reused existing actor run record ID: {self.actor_run_id}")
-                        return self.actor_run_id
-
-                # Create new record
+                # Upsert: insert new record or update existing one (e.g. pre-created by scheduler)
                 cursor.execute("""
                     INSERT INTO actor_runs (
                         run_id, start_time, categories, max_listings,
                         search_query, location_filter, price_min, price_max,
                         status, scraper_id
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id
+                    ON CONFLICT (run_id) DO UPDATE SET
+                        start_time = EXCLUDED.start_time,
+                        categories = EXCLUDED.categories,
+                        max_listings = EXCLUDED.max_listings,
+                        search_query = EXCLUDED.search_query,
+                        location_filter = EXCLUDED.location_filter,
+                        price_min = EXCLUDED.price_min,
+                        price_max = EXCLUDED.price_max,
+                        status = 'running'
+                    RETURNING id, scraper_id
                 """, (
                     self.actor_run_uuid,
                     self.actor_run_start,
@@ -232,9 +213,13 @@ class DatabaseManager:
                     self.scraper_id
                 ))
 
-                self.actor_run_id = cursor.fetchone()[0]
+                row = cursor.fetchone()
+                self.actor_run_id = row[0]
+                # Inherit scraper_id from pre-created record if we don't have one
+                if not self.scraper_id and row[1]:
+                    self.scraper_id = row[1]
                 conn.commit()
-                Actor.log.info(f"Created actor run record with ID: {self.actor_run_id}")
+                Actor.log.info(f"Actor run record ready with ID: {self.actor_run_id}")
                 return self.actor_run_id
 
     def update_actor_run_status(self, status: str, total_listings: int = 0):
