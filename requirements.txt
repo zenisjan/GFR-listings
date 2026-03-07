@@ -1,5 +1,7 @@
 # Core dependencies
 apify < 3.0.0
+crawlee < 0.6.0
+pydantic >= 2.0.0, < 2.11.0
 httpx>=0.24.0
 beautifulsoup4[lxml]
 psycopg2-binary>=2.9.0
