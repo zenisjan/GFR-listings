@@ -29,7 +29,6 @@ from typing import Any, Dict, List, Optional
 import httpx
 from apify import Actor
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
 
 try:
     from .czech_cities import geocode_czech_city
@@ -43,9 +42,6 @@ class OptimizedGovernmentAuctionScraper:
     def __init__(self, client: httpx.AsyncClient):
         self.client = client
         self.api_url = "https://drazby.fs.gov.cz/api/v02/as/data/Predmet_drazby"
-        self.main_url = "https://drazby.fs.gov.cz/client/main"
-        self.browser = None
-        self.playwright = None
         
     async def scrape_all_auctions(
         self,
@@ -71,17 +67,17 @@ class OptimizedGovernmentAuctionScraper:
             List of auction dictionaries
         """
         try:
-            # Step 1: Establish session by visiting main page
-            Actor.log.info("🔗 Establishing session with the website...")
-            session_cookies = await self._establish_session()
-            
-            if session_cookies is None:
+            # Step 1: Establish session via auth API
+            Actor.log.info("Establishing session with the API...")
+            session_ok = await self._establish_session()
+
+            if not session_ok:
                 Actor.log.error("Failed to establish session")
                 return []
-            
+
             # Step 2: Call API to get all auction data
-            Actor.log.info("📡 Fetching all auction data from API...")
-            all_auctions = await self._fetch_all_auctions(session_cookies)
+            Actor.log.info("Fetching all auction data from API...")
+            all_auctions = await self._fetch_all_auctions()
             
             if not all_auctions:
                 Actor.log.warning("⚠️ No auction data received from API")
@@ -117,87 +113,70 @@ class OptimizedGovernmentAuctionScraper:
             Actor.log.error(f"❌ Error in scrape_all_auctions: {e}")
             return []
     
-    async def initialize_browser(self):
-        """Initialize browser for session establishment."""
+    async def _establish_session(self) -> bool:
+        """Establish a session via the site's auth API (no browser needed)."""
         try:
-            self.playwright = await async_playwright().start()
-            self.browser = await self.playwright.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-web-security']
+            # Step 1: Auth check — creates a server-side session
+            resp = await self.client.post(
+                "https://drazby.fs.gov.cz/api/v01/as/auth/check",
+                params={"winAuth": "true", "sso": "true"},
             )
-            Actor.log.info("✅ Browser initialized successfully")
+            Actor.log.info(f"Auth check: {resp.status_code}")
+
+            # Step 2: Login as public/anonymous user
+            resp = await self.client.get(
+                "https://drazby.fs.gov.cz/api/v01/as/owmanager/Login",
+                params={"language": "cs-cz"},
+            )
+            Actor.log.info(f"Login: {resp.status_code}")
+
+            return resp.status_code == 200
         except Exception as e:
-            Actor.log.error(f"❌ Failed to initialize browser: {e}")
-            raise
+            Actor.log.error(f"Failed to establish session: {e}")
+            return False
     
-    async def close_browser(self):
-        """Close browser if it was initialized."""
-        if self.browser:
-            try:
-                await self.browser.close()
-                await self.playwright.stop()
-                Actor.log.info("✅ Browser closed successfully")
-            except Exception as e:
-                Actor.log.warning(f"⚠️ Error closing browser: {e}")
-    
-    async def _establish_session(self) -> Dict[str, str]:
-        """Establish a session using browser automation to get proper cookies."""
-        # First try the API without any cookies — it may not require a session
+    async def _fetch_all_auctions(self) -> List[Dict[str, Any]]:
+        """Fetch all auction data from the API using the same query the SPA uses."""
         try:
-            Actor.log.info("Trying API without session cookies first...")
-            test_resp = await self.client.get(self.api_url)
-            if test_resp.status_code == 200 and test_resp.headers.get('content-type', '').startswith('application/json'):
-                Actor.log.info("API works without session cookies, skipping browser")
-                return {}
-        except Exception:
-            pass
+            # Use the same filter the SPA sends — double-URL-encoded as the server expects
+            params = {
+                "select": "Nazev,Hlavni_miniatura.ID,ID,Akt_hod_prihozu,Mesto_prevzeti,"
+                          "Aukce.Mesto_prevzeti,Rozdilnost_prevzeti,Datum_od_kdy,Datum_do_kdy,"
+                          "Popis,Kod,Minimalni_prihoz,Zjistena_cena,Sazba_dane,Vcetne_DPH,"
+                          "Druh_dr,Stav,Poznamka,Priklepnuto",
+                "filter": "%3APredmet_drazby.Predmety_aktivnich_aukci()",
+                "orderBy": "DESC Aukce.Datum_zverejneni",
+            }
+            response = await self.client.get(self.api_url, params=params, timeout=60.0)
 
-        # Fall back to browser session establishment
-        try:
-            if not self.browser:
-                await self.initialize_browser()
+            # 200 or 206 (partial content) are both valid
+            if response.status_code not in (200, 206):
+                # Fallback: try the long filter from the SPA
+                Actor.log.info(f"First query returned {response.status_code}, trying SPA filter...")
+                params["filter"] = (
+                    "ID%20%3E%200%20AND%20Soubor%20%3D%20NULL%20AND%20"
+                    "Aukce.Zverejneno%20%3D%20TRUE%20AND%20"
+                    "datum_do_kdy%20%3E%20DB.GetDateTime()%20and%20"
+                    "Aukce.Zastaveno%20%3C%3E%20true%20and%20"
+                    "Aukce.Zastav_insolvence%20%3C%3E%20true"
+                )
+                response = await self.client.get(self.api_url, params=params, timeout=60.0)
 
-            page = await self.browser.new_page()
+            if response.status_code not in (200, 206):
+                Actor.log.error(f"API returned {response.status_code}: {response.text[:500]}")
+                return []
 
-            await page.set_extra_http_headers({
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            })
-
-            # Use 'load' instead of 'networkidle' — SPA keeps firing requests
-            await page.goto(self.main_url, wait_until='load', timeout=60000)
-            await page.wait_for_timeout(3000)
-
-            cookies = await page.context.cookies()
-            cookie_dict = {cookie['name']: cookie['value'] for cookie in cookies}
-
-            await page.close()
-
-            Actor.log.info(f"Established session with {len(cookie_dict)} cookies via browser")
-            return cookie_dict
-
-        except Exception as e:
-            Actor.log.error(f"Failed to establish session via browser: {e}")
-            Actor.log.info("Proceeding without session cookies")
-            return {}
-    
-    async def _fetch_all_auctions(self, cookies: Dict[str, str]) -> List[Dict[str, Any]]:
-        """Fetch all auction data from the API."""
-        try:
-            response = await self.client.get(self.api_url, cookies=cookies)
-            response.raise_for_status()
-            
-            # Parse JSON response
             data = response.json()
-            
+
             if isinstance(data, list):
-                Actor.log.info(f"📦 API returned {len(data)} auction records")
+                Actor.log.info(f"API returned {len(data)} auction records")
                 return data
             else:
-                Actor.log.warning(f"⚠️ Unexpected API response format: {type(data)}")
+                Actor.log.warning(f"Unexpected API response format: {type(data)}")
                 return []
-                
+
         except Exception as e:
-            Actor.log.error(f"❌ Failed to fetch auctions from API: {e}")
+            Actor.log.error(f"Failed to fetch auctions from API: {e}")
             return []
     
     def _apply_filters(
@@ -471,24 +450,16 @@ async def main():
         
         async with httpx.AsyncClient(headers=headers, timeout=30.0) as client:
             scraper = OptimizedGovernmentAuctionScraper(client)
-            
-            try:
-                # Initialize browser for session establishment
-                await scraper.initialize_browser()
-                Actor.log.info("🌐 Browser initialized for session establishment")
-                
-                # Scrape all auctions
-                all_auctions = await scraper.scrape_all_auctions(
-                    max_listings=max_listings,
-                    auction_status=auction_status,
-                    price_min=price_min,
-                    price_max=price_max,
-                    location=location,
-                    search_query=search_query
-                )
-            finally:
-                # Always close browser
-                await scraper.close_browser()
+
+            # Scrape all auctions (no browser needed — uses HTTP auth flow)
+            all_auctions = await scraper.scrape_all_auctions(
+                max_listings=max_listings,
+                auction_status=auction_status,
+                price_min=price_min,
+                price_max=price_max,
+                location=location,
+                search_query=search_query
+            )
             
             # Save data to both Apify dataset and database
             if all_auctions:
