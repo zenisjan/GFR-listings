@@ -139,28 +139,19 @@ class OptimizedGovernmentAuctionScraper:
         """Fetch all auction data from the API using the same query the SPA uses."""
         try:
             # Use the same filter the SPA sends — double-URL-encoded as the server expects
+            # Use exactly the fields the SPA requests — no extras
             params = {
-                "select": "Nazev,Hlavni_miniatura.ID,ID,Akt_hod_prihozu,Mesto_prevzeti,"
-                          "Aukce.Mesto_prevzeti,Rozdilnost_prevzeti,Datum_od_kdy,Datum_do_kdy,"
-                          "Popis,Kod,Minimalni_prihoz,Zjistena_cena,Sazba_dane,Vcetne_DPH,"
-                          "Druh_dr,Stav,Poznamka,Priklepnuto",
-                "filter": "%3APredmet_drazby.Predmety_aktivnich_aukci()",
+                "select": ("Nazev,Hlavni_miniatura.ID,ID,Akt_hod_prihozu,"
+                           "Mesto_prevzeti,Aukce.Mesto_prevzeti,Rozdilnost_prevzeti,"
+                           "Datum_od_kdy,Datum_do_kdy"),
+                "filter": ("ID%20%3E%200%20AND%20Soubor%20%3D%20NULL%20AND%20"
+                           "Aukce.Zverejneno%20%3D%20TRUE%20AND%20"
+                           "datum_do_kdy%20%3E%20DB.GetDateTime()%20and%20"
+                           "Aukce.Zastaveno%20%3C%3E%20true%20and%20"
+                           "Aukce.Zastav_insolvence%20%3C%3E%20true"),
                 "orderBy": "DESC Aukce.Datum_zverejneni",
             }
             response = await self.client.get(self.api_url, params=params, timeout=60.0)
-
-            # 200 or 206 (partial content) are both valid
-            if response.status_code not in (200, 206):
-                # Fallback: try the long filter from the SPA
-                Actor.log.info(f"First query returned {response.status_code}, trying SPA filter...")
-                params["filter"] = (
-                    "ID%20%3E%200%20AND%20Soubor%20%3D%20NULL%20AND%20"
-                    "Aukce.Zverejneno%20%3D%20TRUE%20AND%20"
-                    "datum_do_kdy%20%3E%20DB.GetDateTime()%20and%20"
-                    "Aukce.Zastaveno%20%3C%3E%20true%20and%20"
-                    "Aukce.Zastav_insolvence%20%3C%3E%20true"
-                )
-                response = await self.client.get(self.api_url, params=params, timeout=60.0)
 
             if response.status_code not in (200, 206):
                 Actor.log.error(f"API returned {response.status_code}: {response.text[:500]}")
@@ -264,66 +255,26 @@ class OptimizedGovernmentAuctionScraper:
             # Build auction URL
             auction_url = f"https://drazby.fs.gov.cz/client/main#/auction/{auction_id}"
             
-            # Extract basic information
+            # Extract basic information (only fields available from API query)
             title = api_data.get('Nazev', '')
             price = api_data.get('Akt_hod_prihozu', 0)
-            location = api_data.get('Mesto_prevzeti', '')
-            description = api_data.get('Popis', '')
-            
+            # Location: use Mesto_prevzeti, fall back to Aukce.Mesto_prevzeti
+            location = api_data.get('Mesto_prevzeti', '') or api_data.get('Aukce.Mesto_prevzeti', '')
+
             # Extract dates
             date_from = api_data.get('Datum_od_kdy', '')
             date_to = api_data.get('Datum_do_kdy', '')
-            
-            # Extract image information
-            image_id = api_data.get('Hlavni_miniatura', '')
-            image_url = f"https://drazby.fs.gov.cz/api/v02/as/data/Hlavni_miniatura/{image_id}/Data" if image_id else ''
-            
-            # Extract additional auction details
-            auction_code = api_data.get('Kod', '')
-            minimal_bid = api_data.get('Minimalni_prihoz', 0)
-            estimated_value = api_data.get('Zjistena_cena', 0)
-            tax_rate = api_data.get('Sazba_dane', 0)
-            includes_vat = api_data.get('Vcetne_DPH', False)
-            
-            # Extract additional fields that might contain description
-            auction_type = api_data.get('Druh_dr', '')
-            condition = api_data.get('Stav', '')
-            notes = api_data.get('Poznamka', '')
-            
-            # Build comprehensive description
-            # Start with title as the main description if Popis is empty or just contains dates
-            if not description or 'Auction from' in description or len(description.strip()) < 10:
-                full_description = title
+
+            # Extract image information — API returns nested object or ID
+            hlavni_min = api_data.get('Hlavni_miniatura', None)
+            if isinstance(hlavni_min, dict):
+                image_id = hlavni_min.get('ID', '')
             else:
-                full_description = description
-            
-            # Add auction code if available
-            if auction_code:
-                full_description = f"Kód: {auction_code}\n\n{full_description}"
-            
-            # Add auction type if available
-            if auction_type:
-                full_description += f"\n\nTyp dražby: {auction_type}"
-            
-            # Add condition if available
-            if condition:
-                full_description += f"\n\nStav: {condition}"
-            
-            # Add notes if available
-            if notes:
-                full_description += f"\n\nPoznámka: {notes}"
-            
-            # Add auction details
-            if minimal_bid > 0:
-                full_description += f"\n\nMinimální příhoz: {minimal_bid:,.0f} Kč"
-            if estimated_value > 0:
-                full_description += f"\n\nOdhadovaná hodnota: {estimated_value:,.0f} Kč"
-            if tax_rate > 0:
-                full_description += f"\n\nSazba DPH: {tax_rate}%"
-            if includes_vat:
-                full_description += "\n\nCena včetně DPH"
-            
-            # Add auction dates
+                image_id = hlavni_min or ''
+            image_url = f"https://drazby.fs.gov.cz/api/v02/as/data/Hlavni_miniatura/{image_id}/Data" if image_id else ''
+
+            # Build description from available data
+            full_description = title
             if date_from:
                 full_description += f"\n\nZačátek dražby: {date_from}"
             if date_to:
@@ -334,46 +285,33 @@ class OptimizedGovernmentAuctionScraper:
             if image_url:
                 images.append(image_url)
             
-            # Determine auction status
-            is_knocked_down = api_data.get('Priklepnuto', False)
-            is_top = False  # Not available in API
-            
-            # Debug logging for full_description
-            if full_description:
-                Actor.log.debug(f"Created full_description for auction {auction_id}: {full_description[:100]}...")
-            else:
-                Actor.log.warning(f"Empty full_description for auction {auction_id}")
-            
+            # All results from the active-auctions filter are active
+            is_knocked_down = False
+
             return {
                 'id': auction_id,
                 'title': title,
                 'url': auction_url,
-                'category': 'government_auction',  # All are government auctions
+                'category': 'government_auction',
                 'price': float(price) if isinstance(price, (int, float)) else 0.0,
                 'price_text': f"{price:,.0f} Kč" if price > 0 else '',
-                'description': title[:500] if title else (description[:500] if description else ''),  # Use title as description if available
+                'description': title[:500] if title else '',
                 'full_description': full_description,
                 'location': location,
-                'views': 0,  # Not available in API
+                'views': 0,
                 'date': date_from,
-                'is_top': is_top,
+                'is_top': False,
                 'image_url': image_url,
-                'contact_name': '',  # Not available in API
-                'phone': '',  # Not available in API
+                'contact_name': '',
+                'phone': '',
                 'coordinates_lat': self._geocode_location(location),
                 'coordinates_lng': self._geocode_location_lng(location),
                 'images': json.dumps(images),
                 'similar_listings': json.dumps([]),
                 'scraped_at': datetime.now().isoformat(),
-                # Additional auction-specific fields
-                'auction_code': auction_code,
-                'minimal_bid': minimal_bid,
-                'estimated_value': estimated_value,
                 'is_knocked_down': is_knocked_down,
                 'date_from': date_from,
                 'date_to': date_to,
-                'tax_rate': tax_rate,
-                'includes_vat': includes_vat
             }
             
         except Exception as e:
