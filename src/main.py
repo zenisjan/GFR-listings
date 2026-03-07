@@ -75,8 +75,8 @@ class OptimizedGovernmentAuctionScraper:
             Actor.log.info("🔗 Establishing session with the website...")
             session_cookies = await self._establish_session()
             
-            if not session_cookies:
-                Actor.log.error("❌ Failed to establish session")
+            if session_cookies is None:
+                Actor.log.error("Failed to establish session")
                 return []
             
             # Step 2: Call API to get all auction data
@@ -142,32 +142,42 @@ class OptimizedGovernmentAuctionScraper:
     
     async def _establish_session(self) -> Dict[str, str]:
         """Establish a session using browser automation to get proper cookies."""
+        # First try the API without any cookies — it may not require a session
+        try:
+            Actor.log.info("Trying API without session cookies first...")
+            test_resp = await self.client.get(self.api_url)
+            if test_resp.status_code == 200 and test_resp.headers.get('content-type', '').startswith('application/json'):
+                Actor.log.info("API works without session cookies, skipping browser")
+                return {}
+        except Exception:
+            pass
+
+        # Fall back to browser session establishment
         try:
             if not self.browser:
                 await self.initialize_browser()
-            
+
             page = await self.browser.new_page()
-            
-            # Set user agent
+
             await page.set_extra_http_headers({
                 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             })
-            
-            # Navigate to main page to establish session
-            await page.goto(self.main_url, wait_until='networkidle')
-            await page.wait_for_timeout(2000)  # Wait for any JavaScript to run
-            
-            # Get session cookies
+
+            # Use 'load' instead of 'networkidle' — SPA keeps firing requests
+            await page.goto(self.main_url, wait_until='load', timeout=60000)
+            await page.wait_for_timeout(3000)
+
             cookies = await page.context.cookies()
             cookie_dict = {cookie['name']: cookie['value'] for cookie in cookies}
-            
+
             await page.close()
-            
-            Actor.log.info(f"🍪 Established session with {len(cookie_dict)} cookies via browser")
+
+            Actor.log.info(f"Established session with {len(cookie_dict)} cookies via browser")
             return cookie_dict
-            
+
         except Exception as e:
-            Actor.log.error(f"❌ Failed to establish session: {e}")
+            Actor.log.error(f"Failed to establish session via browser: {e}")
+            Actor.log.info("Proceeding without session cookies")
             return {}
     
     async def _fetch_all_auctions(self, cookies: Dict[str, str]) -> List[Dict[str, Any]]:
