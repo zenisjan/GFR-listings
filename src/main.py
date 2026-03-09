@@ -253,7 +253,7 @@ class OptimizedGovernmentAuctionScraper:
                 return None
             
             # Build auction URL
-            auction_url = f"https://drazby.fs.gov.cz/client/main#/auction/{auction_id}"
+            auction_url = f"https://drazby.fs.gov.cz/client/main?formName=predmet&selectedID={auction_id}"
             
             # Extract basic information (only fields available from API query)
             title = api_data.get('Nazev', '')
@@ -265,13 +265,8 @@ class OptimizedGovernmentAuctionScraper:
             date_from = api_data.get('Datum_od_kdy', '')
             date_to = api_data.get('Datum_do_kdy', '')
 
-            # Extract image information — API returns nested object or ID
-            hlavni_min = api_data.get('Hlavni_miniatura', None)
-            if isinstance(hlavni_min, dict):
-                image_id = hlavni_min.get('ID', '')
-            else:
-                image_id = hlavni_min or ''
-            image_url = f"https://drazby.fs.gov.cz/api/v02/as/data/Hlavni_miniatura/{image_id}/Data" if image_id else ''
+            # Image URL: use the Predmet_drazby file endpoint with the auction ID
+            image_url = f"https://drazby.fs.gov.cz/api/v02/as/data/Predmet_drazby/{auction_id}/Hlavni_miniatura/Data"
 
             # Build description from available data
             full_description = title
