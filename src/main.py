@@ -20,7 +20,6 @@ This optimized version:
 """
 
 import asyncio
-import json
 import os
 import re
 from datetime import datetime
@@ -103,6 +102,9 @@ class OptimizedGovernmentAuctionScraper:
     def __init__(self, client: httpx.AsyncClient):
         self.client = client
         self.api_url = "https://drazby.fs.gov.cz/api/v02/as/data/Predmet_drazby"
+        # Why this run is incomplete (session, fetch or parse failed, or the API
+        # served a partial set); main() marks such a run 'failed', not 'completed'.
+        self.incomplete_reasons: List[str] = []
         
     async def scrape_all_auctions(
         self,
@@ -134,6 +136,7 @@ class OptimizedGovernmentAuctionScraper:
 
             if not session_ok:
                 Actor.log.error("Failed to establish session")
+                self.incomplete_reasons.append("could not establish an API session")
                 return []
 
             # Step 2: Call API to get all auction data
@@ -172,6 +175,7 @@ class OptimizedGovernmentAuctionScraper:
             
         except Exception as e:
             Actor.log.error(f"❌ Error in scrape_all_auctions: {e}")
+            self.incomplete_reasons.append(f"scrape_all_auctions: {e!r}")
             return []
     
     async def _establish_session(self) -> bool:
@@ -216,7 +220,17 @@ class OptimizedGovernmentAuctionScraper:
 
             if response.status_code not in (200, 206):
                 Actor.log.error(f"API returned {response.status_code}: {response.text[:500]}")
+                self.incomplete_reasons.append(f"auction API: HTTP {response.status_code}")
                 return []
+
+            if response.status_code == 206:
+                # 206 Partial Content: the API served only a range of the matching
+                # rows (it accepts 'Range: rows=...'), so the rest would be missed.
+                Actor.log.warning("API returned 206 Partial Content — the auction list is incomplete")
+                self.incomplete_reasons.append(
+                    "auction API returned 206 Partial Content "
+                    f"(Content-Range: {response.headers.get('content-range', 'n/a')})"
+                )
 
             data = response.json()
 
@@ -225,10 +239,14 @@ class OptimizedGovernmentAuctionScraper:
                 return data
             else:
                 Actor.log.warning(f"Unexpected API response format: {type(data)}")
+                self.incomplete_reasons.append(
+                    f"auction API: unexpected response format ({type(data).__name__})"
+                )
                 return []
 
         except Exception as e:
             Actor.log.error(f"Failed to fetch auctions from API: {e}")
+            self.incomplete_reasons.append(f"auction API: {e!r}")
             return []
     
     def _apply_filters(
@@ -326,8 +344,11 @@ class OptimizedGovernmentAuctionScraper:
             date_from = api_data.get('Datum_od_kdy', '')
             date_to = api_data.get('Datum_do_kdy', '')
 
-            # Image URL: use the Predmet_drazby file endpoint with the auction ID
-            image_url = f"https://drazby.fs.gov.cz/api/v02/as/data/Predmet_drazby/{auction_id}/Hlavni_miniatura/Data"
+            # No image URL: the site's own thumbnail URL
+            # (client/thumbnail_images/Priloha_predmetu/{Hlavni_miniatura.ID}) only
+            # serves the image inside a drazby session; without its cookies it
+            # redirects to the NIA login, so the map's <img> would be broken.
+            image_url = ''
 
             # Build description from available data
             full_description = title
@@ -336,10 +357,8 @@ class OptimizedGovernmentAuctionScraper:
             if date_to:
                 full_description += f"\n\nKonec dražby: {date_to}"
             
-            # Build images array
-            images = []
-            if image_url:
-                images.append(image_url)
+            # Build images array (a plain list — database.py JSON-encodes it)
+            images = [image_url] if image_url else []
             
             # All results from the active-auctions filter are active
             is_knocked_down = False
@@ -362,8 +381,8 @@ class OptimizedGovernmentAuctionScraper:
                 'phone': '',
                 'coordinates_lat': self._geocode_location(location),
                 'coordinates_lng': self._geocode_location_lng(location),
-                'images': json.dumps(images),
-                'similar_listings': json.dumps([]),
+                'images': images,
+                'similar_listings': [],
                 'scraped_at': datetime.now().isoformat(),
                 'is_knocked_down': is_knocked_down,
                 'date_from': date_from,
@@ -455,6 +474,9 @@ async def main():
                 search_query=search_query
             )
             
+            incomplete_reasons = list(scraper.incomplete_reasons)
+            saved = 0  # rows actually inserted into the database
+
             # Save data to both Apify dataset and database
             if all_auctions:
                 # Save to Apify dataset (all auctions)
@@ -471,6 +493,7 @@ async def main():
                         if db_auctions:
                             Actor.log.info("💾 Saving active auctions to database...")
                             db_manager.insert_listings(db_auctions)
+                            saved = len(db_auctions)
                             Actor.log.info(f"✅ Saved {len(db_auctions)} active listings to database")
                         else:
                             Actor.log.info("ℹ️ No active auctions to save to database")
@@ -483,35 +506,50 @@ async def main():
                             db_auctions = [auction for auction in all_auctions if not auction.get('is_knocked_down', True)]
                             if db_auctions:
                                 db_manager.insert_listings(db_auctions)
+                                saved = len(db_auctions)
                                 Actor.log.info(f"✅ Successfully saved {len(db_auctions)} active listings to database after retry")
                         except Exception as retry_e:
                             Actor.log.error(f"❌ Failed to save listings to database even after retry: {retry_e}")
+                            incomplete_reasons.append(f"database insert failed: {retry_e!r}")
             else:
                 Actor.log.warning("⚠️ No auctions found matching the specified criteria")
             
             # Zero auctions almost always means upstream breakage (API change,
             # auth/session failure) rather than an empty market — mark the run
             # 'failed' so sold-detection ignores it instead of flagging every
-            # previously-seen listing as sold.
-            run_status = 'completed' if all_auctions else 'failed'
+            # previously-seen listing as sold. The same goes for a run that stopped
+            # early (session/fetch failure, a 206 partial list, a failed insert):
+            # sold-detection would flag every listing it missed as sold.
+            run_status = 'completed' if saved and not incomplete_reasons else 'failed'
+            for reason in incomplete_reasons:
+                Actor.log.error(f"Run incomplete — {reason}")
 
             # Update actor run status in database
             if db_manager_available:
                 try:
-                    db_manager.update_actor_run_status(run_status, len(all_auctions))
+                    db_manager.update_actor_run_status(run_status, saved)
                     Actor.log.info("✅ Updated actor run status in database")
                 except Exception as e:
                     Actor.log.error(f"❌ Failed to update actor run status: {e}")
+
+            if incomplete_reasons:
+                more = f" (+{len(incomplete_reasons) - 1} more)" if len(incomplete_reasons) > 1 else ""
+                try:
+                    await Actor.set_status_message(f"Stopped early: {incomplete_reasons[0]}{more}")
+                except Exception as e:
+                    Actor.log.warning(f"Could not set the run's status message: {e}")
             
             # Final summary
             Actor.log.info("=" * 60)
-            Actor.log.info("🎉 SCRAPING COMPLETED SUCCESSFULLY")
-            Actor.log.info(f"📊 Total auctions scraped: {len(all_auctions)}")
-            if all_auctions and db_manager_available:
-                db_auctions_count = len([auction for auction in all_auctions if not auction.get('is_knocked_down', True)])
-                Actor.log.info(f"💾 Data saved to: Apify dataset ({len(all_auctions)} auctions) and database ({db_auctions_count} active auctions)")
+            if run_status == 'completed':
+                Actor.log.info("🎉 SCRAPING COMPLETED SUCCESSFULLY")
             else:
-                Actor.log.info(f"💾 Data saved to: {'Apify dataset' + (' and database' if db_manager_available else '')}")
+                Actor.log.warning("⚠️ SCRAPING FINISHED — run status: failed")
+            Actor.log.info(f"📊 Total auctions scraped: {len(all_auctions)}")
+            if saved:
+                Actor.log.info(f"💾 Data saved to: Apify dataset ({len(all_auctions)} auctions) and database ({saved} active auctions)")
+            else:
+                Actor.log.info(f"💾 Data saved to: {'Apify dataset only' if all_auctions else 'nowhere'}")
             Actor.log.info("=" * 60)
 
 
