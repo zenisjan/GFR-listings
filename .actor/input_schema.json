@@ -13,7 +13,7 @@
         "auctionStatus": {
             "title": "Auction status filter",
             "type": "string",
-            "description": "Filter auctions by status. The API provides all auctions, so this filters the results.",
+            "description": "Active = auctions still open for bidding or upcoming, not knocked down. Ended = auctions whose bidding has closed, knocked down or not (the API serves about the last three months). The database only receives active auctions; ended ones go to the dataset only.",
             "editor": "select",
             "enum": [
                 "all",

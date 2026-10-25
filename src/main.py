@@ -7,14 +7,14 @@ This scraper directly calls the API endpoint to get all auction data at once,
 eliminating the need for browser automation and complex pagination logic.
 
 The API provides comprehensive auction data including:
-- All auction details (title, description, price, location, dates)
-- Contact information
-- Images
+- All auction details (title, description, price context, pickup place, dates)
+- Knock-down flag (Priklepnuto)
 - Auction status and metadata
 
 This optimized version:
 - Uses only HTTP requests (no Playwright)
-- Single API call gets all data
+- One API call for the live auctions, one more for the ended ones
+  (auctionStatus 'ended' / 'all')
 - Applies filters after fetching data
 - Much faster and more reliable
 """
@@ -22,17 +22,25 @@ This optimized version:
 import asyncio
 import os
 import re
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+import unicodedata
+import urllib.parse
+from datetime import date, datetime, time, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from apify import Actor
 from bs4 import BeautifulSoup
 
 try:
-    from .czech_cities import geocode_czech_city
+    from .czech_cities import CZECH_CITIES
 except ImportError:
-    from czech_cities import geocode_czech_city
+    from czech_cities import CZECH_CITIES
+
+try:
+    from zoneinfo import ZoneInfo
+    _PRAGUE_TZ = ZoneInfo("Europe/Prague")
+except Exception:  # no tz database in the image: fall back to the EU rule below
+    _PRAGUE_TZ = None
 
 
 # Bounded exponential backoff for transient fetch failures (timeouts, resets,
@@ -64,6 +72,279 @@ async def _request_with_retry(client, method, url, attempts=3, **kwargs):
             f"in {delay:.0f}s: {url}"
         )
         await asyncio.sleep(delay)
+
+
+# --- API query ------------------------------------------------------------------
+# Predmet_drazby attributes to request. All of them exist on the server model
+# (POST /api/v01/as/descriptions/Classes ["Predmet_drazby"]); the March outage came
+# from 'Stav' and 'Poznamka', which do not. A known attribute the anonymous session
+# may not read is simply left out of the rows, and so is any null value.
+_SELECT_FIELDS = (
+    # the SPA's own list query
+    "Nazev", "Hlavni_miniatura.ID", "ID", "Akt_hod_prihozu", "Mesto_prevzeti",
+    "Aukce.Mesto_prevzeti", "Rozdilnost_prevzeti", "Datum_od_kdy", "Datum_do_kdy",
+    # knock-down flag, the item's own description, price context, auction kind and
+    # the free-text pickup / viewing places (location fallback)
+    "Priklepnuto", "Popis", "Zjistena_cena", "Nejnizsi_podani", "Minimalni_prihoz",
+    "Vyse_jistoty", "Aukce.Kod", "Aukce.Druh_dr.Nazev", "Aukce.Misto_vyzvednuti",
+    "Aukce.Info_prohlidka",
+)
+
+
+def _api_filter(expression: str) -> str:
+    """The data API expects its filter URL-encoded once more on top of httpx's encoding."""
+    return urllib.parse.quote(expression, safe="().")
+
+
+# Published, not stopped auctions whose bidding has not closed yet (what the site
+# lists), and the same auctions once the closing time has passed: the API keeps
+# serving about three months of them (437 on 2026-10-25, one 200 response).
+_LIVE_FILTER = _api_filter(
+    "ID > 0 AND Soubor = NULL AND Aukce.Zverejneno = TRUE AND datum_do_kdy > DB.GetDateTime() "
+    "and Aukce.Zastaveno <> true and Aukce.Zastav_insolvence <> true")
+_ENDED_FILTER = _api_filter(
+    "ID > 0 AND Soubor = NULL AND Aukce.Zverejneno = TRUE AND datum_do_kdy < DB.GetDateTime() "
+    "and Aukce.Zastaveno <> true and Aukce.Zastav_insolvence <> true")
+
+_AUCTION_STATUSES = ("active", "ended", "all")
+_ENDED_MARK = "_gfr_ended"  # set on rows that came from the ended-auctions query
+_LIVE_STATUSES = ("upcoming", "running")
+
+
+# --- value helpers -----------------------------------------------------------------
+def _flag(value: Any) -> bool:
+    """An API Boolean; missing or null (the API omits nulls) counts as False."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "ano")
+    return False
+
+
+def _num(value: Any) -> Optional[float]:
+    """An API Money/number value as float, or None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.replace("\u00a0", "").replace(" ", "").replace(",", "."))
+        except ValueError:
+            return None
+    return None
+
+
+def _czk(value: Optional[float]) -> str:
+    """2120172.0 -> '2 120 172 Kč' (Czech grouping; decimals only when present)."""
+    if value is None:
+        return ""
+    if float(value).is_integer():
+        text = f"{value:,.0f}".replace(",", " ")
+    else:
+        text = f"{value:,.2f}".replace(",", " ").replace(".", ",")
+    return f"{text} Kč"
+
+
+def _text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _one_line(value: Any) -> str:
+    """Free text squeezed onto one 'Label: value' line of full_description."""
+    return re.sub(r"\s+", " ", value).strip() if isinstance(value, str) else ""
+
+
+# --- dates -------------------------------------------------------------------------
+# The API's DateTime values carry no offset ("2026-11-24T09:45:00.0000000"). They are
+# Europe/Prague wall-clock times: the SPA renders offset-less values as-is (its
+# DateUtils.fromXsdDateTime), and auction start/end hours have the same distribution
+# in summer (CEST) and winter (CET) — UTC values would shift by an hour.
+_API_DATETIME_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?\s*(Z|[+-]\d{2}:?\d{2})?$")
+
+
+def _last_sunday(year: int, month: int) -> date:
+    """Last Sunday of March or October (both have 31 days)."""
+    day = date(year, month, 31)
+    return day - timedelta(days=(day.weekday() + 1) % 7)
+
+
+def _prague_utc_offset(local: datetime) -> timedelta:
+    """UTC offset of a Prague wall-clock time under the EU summer-time rule; the hour
+    that does not exist (March) or repeats (October) resolves like zoneinfo's fold=0."""
+    start = datetime.combine(_last_sunday(local.year, 3), time(3))
+    end = datetime.combine(_last_sunday(local.year, 10), time(3))
+    return timedelta(hours=2) if start <= local.replace(tzinfo=None) < end else timedelta(hours=1)
+
+
+def _parse_api_datetime(value: Any) -> Optional[datetime]:
+    """API DateTime -> timezone-aware datetime (Europe/Prague when no offset), or None."""
+    if not isinstance(value, str):
+        return None
+    m = _API_DATETIME_RE.match(value.strip())
+    if not m:
+        return None
+    year, month, day, hour, minute, second, tz = m.groups()
+    try:
+        naive = datetime(int(year), int(month), int(day), int(hour), int(minute), int(second or 0))
+    except ValueError:
+        return None
+    if tz:  # an explicit offset is already unambiguous: keep it
+        if tz == "Z":
+            return naive.replace(tzinfo=timezone.utc)
+        digits = tz[1:].replace(":", "")
+        offset = timedelta(hours=int(digits[:2]), minutes=int(digits[2:]))
+        return naive.replace(tzinfo=timezone(offset if tz[0] == "+" else -offset))
+    if _PRAGUE_TZ is not None:
+        return naive.replace(tzinfo=_PRAGUE_TZ)
+    return naive.replace(tzinfo=timezone(_prague_utc_offset(naive)))
+
+
+def _iso_datetime(value: Any) -> str:
+    """API DateTime -> ISO 8601 with its UTC offset, e.g. '2026-11-24T09:45:00+01:00';
+    '' when missing, the raw text (max 100 chars, the DB column) when unparseable."""
+    parsed = _parse_api_datetime(value)
+    if parsed is not None:
+        return parsed.isoformat(timespec="seconds")
+    if value is None:
+        return ""
+    return str(value).strip()[:100]
+
+
+# --- location ------------------------------------------------------------------------
+# Coordinates come only from the town gazetteer in czech_cities.py, matched on whole
+# names: a place that is not in it gets None rather than another town's coordinates
+# (the old substring/district fallbacks could do that).
+def _fold(text: str) -> str:
+    """Lower case without diacritics, one output char per input char."""
+    return "".join(unicodedata.normalize("NFD", ch)[0].lower()[:1] for ch in text)
+
+
+# Okres (district) names the gazetteer maps to the city centre although they are the
+# rural ring around the city: a village there must not get the city's coordinates.
+_NOT_A_TOWN = ("praha-vychod", "praha-zapad", "plzen-jih", "plzen-sever", "brno-venkov")
+_TOWNS: Dict[str, Tuple[float, float]] = {}
+for _name, _coords in CZECH_CITIES.items():
+    _key = re.sub(r"\s+", " ", _fold(_name)).strip()
+    if _key not in _NOT_A_TOWN:
+        _TOWNS.setdefault(_key, _coords)
+_TOWN_KEYS = sorted(_TOWNS, key=len, reverse=True)  # longest name first
+# Statutory cities whose districts are written "City-District" / "City District"
+# ("Brno-Královo Pole", "Ostrava Poruba", "Pardubice II"): still the same city.
+_DISTRICT_CITIES = {
+    "praha", "brno", "ostrava", "plzen", "usti nad labem", "liberec", "olomouc",
+    "pardubice", "hradec kralove", "ceske budejovice", "zlin", "opava", "karvina",
+    "havirov", "kladno", "jihlava", "karlovy vary",
+}
+# Words that continue a place name: "Hranice u Aše", "Staré Město pod Sněžníkem".
+_NAME_CONNECTORS = {"u", "nad", "pod", "na", "v", "ve", "pri"}
+_ROMAN_RE = re.compile(r"^[IVX]+\.?$")
+_PSC_RE = re.compile(r"(?<!\d)[1-7]\d{2} ?\d{2}(?!\d)")
+_PART_MARKER_RE = re.compile(
+    r"^(?:k\.\s*ú\.|kú\b|katastrální\s+území|obec\b|SSHR\b|sklad\s+SSHR\b)[\s,:-]*", re.IGNORECASE)
+# "obec X" / "v obci X" / "obec a okres X" in a real-estate text names the municipality
+_OBEC_RE = re.compile(r"\b(?:obec\s+a\s+okres|[Vv]\s+obci|[Oo]bec)\s+(?=[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ])")
+_PRAHA_RE = re.compile(r"\bhl(?:avní)?\.?\s*m(?:ěsto|\.)?\s*Praha\b", re.IGNORECASE)
+
+
+def _name_ends_here(key: str, rest: str) -> bool:
+    """Does a gazetteer name matched at the start of a text end where `rest` starts?"""
+    if not rest:
+        return True
+    first = rest[0]
+    if first in "-–":  # "Brno-Královo Pole" (district) vs "Sedlec-Prčice" (other town)
+        return key in _DISTRICT_CITIES
+    if first.isalpha():  # mid-word: "Břeclavská" is not "Břeclav"
+        return False
+    if not first.isspace():  # punctuation or a digit ("Praha4")
+        return True
+    nxt = rest.lstrip()
+    if not nxt or nxt[0] in "-–" or not nxt[0].isalpha():  # " - Střekov", " 4", " (..."
+        return True
+    word = re.match(r"[^\s,.;:()/*-]+", nxt).group(0)
+    if _ROMAN_RE.match(word):  # "Pardubice II"
+        return True
+    if word[0].isupper():  # "Nová Ves", "Staré Město" — unless a city district
+        return key in _DISTRICT_CITIES
+    return _fold(word) not in _NAME_CONNECTORS
+
+
+def _town_at(text: str) -> Optional[Tuple[str, Tuple[float, float]]]:
+    """The gazetteer town that `text` starts with, as (name as written, (lat, lng))."""
+    text = re.sub(r"\s+", " ", text).strip()
+    folded = _fold(text)
+    compact = re.sub(r"[\s\-–]+", "-", folded)
+    for blocked in _NOT_A_TOWN:  # "Praha-východ", "Brno - venkov": a district, not the city
+        if compact.startswith(blocked) and not compact[len(blocked):len(blocked) + 1].isalpha():
+            return None
+    for key in _TOWN_KEYS:
+        if folded.startswith(key) and _name_ends_here(key, text[len(key):]):
+            return text[:len(key)], _TOWNS[key]
+    return None
+
+
+def _town_in_place_field(value: Any) -> Optional[Tuple[str, Tuple[float, float]]]:
+    """Town named by a pickup-place field such as 'Štěpánská 28, Praha 1',
+    'Vlkov, Osová Bitýška, okr. Žďár nad Sázavou', 'SSHR Polerady', 'k.ú. Jince',
+    'Břeclavská 1100, 691 42 Valtice.' — comma parts left to right."""
+    if not isinstance(value, str):
+        return None
+    # "Podolí (Uh. Hradiště)": the bracket is a district hint, not the place
+    for part in re.sub(r"\([^)]*\)", " ", value).split(","):
+        part = part.strip(" .;:\t\n")
+        if not part or re.match(r"(?i)^okr(?:es\b|\.)", part):  # a district is not a place
+            continue
+        part = _PSC_RE.sub(" ", part, count=1) if _PSC_RE.match(part) else part
+        part = _PART_MARKER_RE.sub("", part.strip())
+        found = _town_at(part)
+        if found:
+            return found
+    return None
+
+
+def _town_after_psc(value: Any) -> Optional[Tuple[str, Tuple[float, float]]]:
+    """Town after a postcode in free text ('..., 400 21 Ústí nad Labem, 9:00 ...')."""
+    if not isinstance(value, str):
+        return None
+    for m in _PSC_RE.finditer(value):
+        found = _town_at(value[m.end():].lstrip(" ,"))
+        if found:
+            return found
+    return None
+
+
+def _resolve_place(api_data: Dict[str, Any]) -> Tuple[Optional[Tuple[float, float]], Optional[str]]:
+    """Coordinates of an auction item and the gazetteer town they belong to.
+
+    1. Real estate: the municipality its own text names ("katastrální území Královo
+       Pole ... obec Brno"). If that municipality is not in the gazetteer, stop: the
+       pickup town of a property may be a homonym or the tax office.
+    2. The item's pickup town (Mesto_prevzeti), then the auction's.
+    3. A postcode + town in the auction's pickup or viewing text.
+    """
+    title = _text(api_data.get("Nazev"))
+    popis = _text(api_data.get("Popis"))
+    kind = _fold(_text(api_data.get("Aukce.Druh_dr.Nazev")))
+    is_real_estate = "nemovit" in kind or (
+        not kind and re.search(r"katastráln|k\.\s?ú\.", f"{title} {popis}", re.IGNORECASE))
+    if is_real_estate:
+        text = _PRAHA_RE.sub("Praha", f"{title}\n{popis}")
+        m = _OBEC_RE.search(text)
+        if m:
+            found = _town_at(text[m.end():])
+            return (found[1], found[0]) if found else (None, None)
+    for field in ("Mesto_prevzeti", "Aukce.Mesto_prevzeti"):
+        found = _town_in_place_field(api_data.get(field))
+        if found:
+            return found[1], found[0]
+    for field in ("Aukce.Misto_vyzvednuti", "Aukce.Info_prohlidka"):
+        found = _town_after_psc(api_data.get(field))
+        if found:
+            return found[1], found[0]
+    return None, None
 
 
 class _FailRunOnCrash:
@@ -106,6 +387,15 @@ class OptimizedGovernmentAuctionScraper:
         # served a partial set); main() marks such a run 'failed', not 'completed'.
         self.incomplete_reasons: List[str] = []
         
+    @staticmethod
+    def normalise_status(auction_status: Any) -> str:
+        """'active' (default) | 'ended' | 'all'; anything else falls back to 'active'."""
+        status = str(auction_status or "active").strip().lower()
+        if status not in _AUCTION_STATUSES:
+            Actor.log.warning(f"Unknown auctionStatus {auction_status!r}; using 'active'")
+            return "active"
+        return status
+
     async def scrape_all_auctions(
         self,
         max_listings: int = 0,
@@ -120,7 +410,8 @@ class OptimizedGovernmentAuctionScraper:
         
         Args:
             max_listings: Maximum number of listings to return (0 = all)
-            auction_status: Filter by status ("all", "active", "ended")
+            auction_status: "active" = live auctions not knocked down; "ended" =
+                auctions whose bidding has closed (knocked down or not); "all" = both
             price_min: Minimum price filter in CZK
             price_max: Maximum price filter in CZK
             location: Location filter (city/region)
@@ -129,6 +420,7 @@ class OptimizedGovernmentAuctionScraper:
         Returns:
             List of auction dictionaries
         """
+        status = self.normalise_status(auction_status)
         try:
             # Step 1: Establish session via auth API
             Actor.log.info("Establishing session with the API...")
@@ -139,9 +431,14 @@ class OptimizedGovernmentAuctionScraper:
                 self.incomplete_reasons.append("could not establish an API session")
                 return []
 
-            # Step 2: Call API to get all auction data
-            Actor.log.info("Fetching all auction data from API...")
-            all_auctions = await self._fetch_all_auctions()
+            # Step 2: Live auctions for 'active'/'all', ended ones for 'ended'/'all'
+            all_auctions: List[Dict[str, Any]] = []
+            if status in ("active", "all"):
+                Actor.log.info("Fetching live auction data from API...")
+                all_auctions.extend(await self._fetch_auctions("live"))
+            if status in ("ended", "all"):
+                Actor.log.info("Fetching ended auction data from API...")
+                all_auctions.extend(await self._fetch_auctions("ended"))
             
             if not all_auctions:
                 Actor.log.warning("⚠️ No auction data received from API")
@@ -152,7 +449,7 @@ class OptimizedGovernmentAuctionScraper:
             # Step 3: Apply filters
             Actor.log.info("🔍 Applying filters to auction data...")
             filtered_auctions = self._apply_filters(
-                all_auctions, auction_status, price_min, price_max, location, search_query
+                all_auctions, status, price_min, price_max, location, search_query
             )
             
             Actor.log.info(f"📊 After filtering: {len(filtered_auctions)} auctions match criteria")
@@ -200,53 +497,53 @@ class OptimizedGovernmentAuctionScraper:
             Actor.log.error(f"Failed to establish session: {e}")
             return False
     
-    async def _fetch_all_auctions(self) -> List[Dict[str, Any]]:
-        """Fetch all auction data from the API using the same query the SPA uses."""
+    async def _fetch_auctions(self, which: str) -> List[Dict[str, Any]]:
+        """Fetch the live (`which='live'`) or the ended (`'ended'`) auctions in one call,
+        with the SPA's list filter (the ended query flips its closing-time test)."""
+        ended = which == "ended"
+        label = "ended-auction API" if ended else "auction API"
         try:
-            # Use the same filter the SPA sends — double-URL-encoded as the server expects
-            # Use exactly the fields the SPA requests — no extras
             params = {
-                "select": ("Nazev,Hlavni_miniatura.ID,ID,Akt_hod_prihozu,"
-                           "Mesto_prevzeti,Aukce.Mesto_prevzeti,Rozdilnost_prevzeti,"
-                           "Datum_od_kdy,Datum_do_kdy"),
-                "filter": ("ID%20%3E%200%20AND%20Soubor%20%3D%20NULL%20AND%20"
-                           "Aukce.Zverejneno%20%3D%20TRUE%20AND%20"
-                           "datum_do_kdy%20%3E%20DB.GetDateTime()%20and%20"
-                           "Aukce.Zastaveno%20%3C%3E%20true%20and%20"
-                           "Aukce.Zastav_insolvence%20%3C%3E%20true"),
-                "orderBy": "DESC Aukce.Datum_zverejneni",
+                "select": ",".join(_SELECT_FIELDS),
+                "filter": _ENDED_FILTER if ended else _LIVE_FILTER,
+                "orderBy": "DESC Datum_do_kdy" if ended else "DESC Aukce.Datum_zverejneni",
             }
             response = await _request_with_retry(self.client, "GET", self.api_url, params=params, timeout=60.0)
 
             if response.status_code not in (200, 206):
-                Actor.log.error(f"API returned {response.status_code}: {response.text[:500]}")
-                self.incomplete_reasons.append(f"auction API: HTTP {response.status_code}")
+                Actor.log.error(f"{label} returned {response.status_code}: {response.text[:500]}")
+                self.incomplete_reasons.append(f"{label}: HTTP {response.status_code}")
                 return []
 
             if response.status_code == 206:
                 # 206 Partial Content: the API served only a range of the matching
                 # rows (it accepts 'Range: rows=...'), so the rest would be missed.
-                Actor.log.warning("API returned 206 Partial Content — the auction list is incomplete")
+                content_range = (response.headers.get('content-range')
+                                 or response.headers.get('x-content-range') or 'n/a')
+                Actor.log.warning(f"{label} returned 206 Partial Content — the auction list is incomplete")
                 self.incomplete_reasons.append(
-                    "auction API returned 206 Partial Content "
-                    f"(Content-Range: {response.headers.get('content-range', 'n/a')})"
+                    f"{label} returned 206 Partial Content (Content-Range: {content_range})"
                 )
 
             data = response.json()
 
             if isinstance(data, list):
-                Actor.log.info(f"API returned {len(data)} auction records")
+                Actor.log.info(f"{label} returned {len(data)} auction records")
+                if ended:
+                    for row in data:
+                        if isinstance(row, dict):
+                            row[_ENDED_MARK] = True
                 return data
             else:
                 Actor.log.warning(f"Unexpected API response format: {type(data)}")
                 self.incomplete_reasons.append(
-                    f"auction API: unexpected response format ({type(data).__name__})"
+                    f"{label}: unexpected response format ({type(data).__name__})"
                 )
                 return []
 
         except Exception as e:
-            Actor.log.error(f"Failed to fetch auctions from API: {e}")
-            self.incomplete_reasons.append(f"auction API: {e!r}")
+            Actor.log.error(f"Failed to fetch auctions from {label}: {e}")
+            self.incomplete_reasons.append(f"{label}: {e!r}")
             return []
     
     def _apply_filters(
@@ -261,12 +558,12 @@ class OptimizedGovernmentAuctionScraper:
         """Apply filters to the auction data."""
         filtered = auctions.copy()
         
-        # Filter by auction status
+        # Filter by auction status (a missing Priklepnuto means not knocked down)
         if auction_status == "active":
-            filtered = [a for a in filtered if not a.get('Priklepnuto', True)]
+            filtered = [a for a in filtered if not a.get(_ENDED_MARK) and not _flag(a.get('Priklepnuto'))]
             Actor.log.info(f"🟢 Filtered to active auctions: {len(filtered)} remaining")
         elif auction_status == "ended":
-            filtered = [a for a in filtered if a.get('Priklepnuto', False)]
+            filtered = [a for a in filtered if a.get(_ENDED_MARK) or _flag(a.get('Priklepnuto'))]
             Actor.log.info(f"🔴 Filtered to ended auctions: {len(filtered)} remaining")
         # "all" means no status filtering
         
@@ -289,7 +586,8 @@ class OptimizedGovernmentAuctionScraper:
             location_lower = location.lower().strip()
             location_filtered = []
             for auction in filtered:
-                auction_location = auction.get('Mesto_prevzeti', '').lower()
+                auction_location = (_text(auction.get('Mesto_prevzeti'))
+                                    or _text(auction.get('Aukce.Mesto_prevzeti'))).lower()
                 if location_lower in auction_location:
                     location_filtered.append(auction)
             filtered = location_filtered
@@ -300,8 +598,8 @@ class OptimizedGovernmentAuctionScraper:
             query_lower = search_query.lower().strip()
             search_filtered = []
             for auction in filtered:
-                title = auction.get('Nazev', '').lower()
-                description = auction.get('Popis', '').lower()
+                title = _text(auction.get('Nazev')).lower()
+                description = _text(auction.get('Popis')).lower()
                 if query_lower in title or query_lower in description:
                     search_filtered.append(auction)
             filtered = search_filtered
@@ -309,40 +607,48 @@ class OptimizedGovernmentAuctionScraper:
         
         return filtered
     
-    def _geocode_location(self, location: str) -> Optional[float]:
-        """Return latitude for a Czech city name, or None."""
-        if not location:
-            return None
-        coords = geocode_czech_city(location.strip())
-        return coords[0] if coords else None
-
-    def _geocode_location_lng(self, location: str) -> Optional[float]:
-        """Return longitude for a Czech city name, or None."""
-        if not location:
-            return None
-        coords = geocode_czech_city(location.strip())
-        return coords[1] if coords else None
-
     def _convert_to_standard_format(self, api_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Convert API data to standardized listing format."""
+        auction_id = api_data.get('ID') if isinstance(api_data, dict) else None
         try:
             # Extract auction ID
-            auction_id = str(api_data.get('ID', ''))
-            if not auction_id:
+            if auction_id in (None, ''):
+                Actor.log.warning("⚠️ Skipping an auction record without ID")
                 return None
+            auction_id = str(auction_id)
             
             # Build auction URL
             auction_url = f"https://drazby.fs.gov.cz/client/main?formName=predmet&selectedID={auction_id}"
             
-            # Extract basic information (only fields available from API query)
-            title = api_data.get('Nazev', '')
-            price = api_data.get('Akt_hod_prihozu', 0)
+            title = _text(api_data.get('Nazev'))
+            # The item's own description (Popis); before it was selected the
+            # description was a copy of the title.
+            popis = _text(api_data.get('Popis'))
+            # price = current bid (Akt_hod_prihozu), which equals the minimum bid
+            # until someone bids.
+            price = _num(api_data.get('Akt_hod_prihozu'))
+            price = price if price is not None else 0.0
+            appraisal = _num(api_data.get('Zjistena_cena'))
+            minimum_bid = _num(api_data.get('Nejnizsi_podani'))
+            minimum_increment = _num(api_data.get('Minimalni_prihoz'))
+            deposit = _num(api_data.get('Vyse_jistoty'))
+            kind = _text(api_data.get('Aukce.Druh_dr.Nazev'))
             # Location: use Mesto_prevzeti, fall back to Aukce.Mesto_prevzeti
-            location = api_data.get('Mesto_prevzeti', '') or api_data.get('Aukce.Mesto_prevzeti', '')
+            location = _text(api_data.get('Mesto_prevzeti')) or _text(api_data.get('Aukce.Mesto_prevzeti'))
+            coordinates, geocoded_place = _resolve_place(api_data)
 
-            # Extract dates
-            date_from = api_data.get('Datum_od_kdy', '')
-            date_to = api_data.get('Datum_do_kdy', '')
+            # Dates: Prague wall-clock time in the API -> ISO 8601 with offset
+            date_from = _iso_datetime(api_data.get('Datum_od_kdy'))
+            date_to = _iso_datetime(api_data.get('Datum_do_kdy'))
+            starts = _parse_api_datetime(api_data.get('Datum_od_kdy'))
+
+            is_knocked_down = _flag(api_data.get('Priklepnuto'))
+            if api_data.get(_ENDED_MARK):
+                auction_status = 'ended'
+            elif starts is not None and starts > datetime.now(timezone.utc):
+                auction_status = 'upcoming'
+            else:
+                auction_status = 'running'
 
             # No image URL: the site's own thumbnail URL
             # (client/thumbnail_images/Priloha_predmetu/{Hlavni_miniatura.ID}) only
@@ -350,27 +656,35 @@ class OptimizedGovernmentAuctionScraper:
             # redirects to the NIA login, so the map's <img> would be broken.
             image_url = ''
 
-            # Build description from available data
-            full_description = title
-            if date_from:
-                full_description += f"\n\nZačátek dražby: {date_from}"
-            if date_to:
-                full_description += f"\n\nKonec dražby: {date_to}"
+            # Full description: the item's description, then the auction facts as
+            # "Label: value" lines (the web app's normalizer reads "Konec dražby").
+            facts = [
+                ("Druh dražby", kind),
+                ("Zjištěná cena", _czk(appraisal)),
+                ("Nejnižší podání", _czk(minimum_bid)),
+                ("Minimální příhoz", _czk(minimum_increment)),
+                ("Dražební jistota", _czk(deposit)),
+                ("Začátek dražby", date_from),
+                ("Konec dražby", date_to),
+                ("Místo převzetí", _one_line(location)),
+                ("Místo vyzvednutí", _one_line(api_data.get('Aukce.Misto_vyzvednuti'))),
+                ("Prohlídka", _one_line(api_data.get('Aukce.Info_prohlidka'))),
+                ("Číslo dražby", _one_line(api_data.get('Aukce.Kod'))),
+            ]
+            fact_lines = "\n".join(f"{label}: {value}" for label, value in facts if value)
+            full_description = "\n\n".join(part for part in (popis or title, fact_lines) if part)
             
             # Build images array (a plain list — database.py JSON-encodes it)
             images = [image_url] if image_url else []
-            
-            # All results from the active-auctions filter are active
-            is_knocked_down = False
 
             return {
                 'id': auction_id,
                 'title': title,
                 'url': auction_url,
                 'category': 'government_auction',
-                'price': float(price) if isinstance(price, (int, float)) else 0.0,
+                'price': price,
                 'price_text': f"{price:,.0f} Kč" if price > 0 else '',
-                'description': title[:500] if title else '',
+                'description': popis or title,
                 'full_description': full_description,
                 'location': location,
                 'views': 0,
@@ -379,18 +693,28 @@ class OptimizedGovernmentAuctionScraper:
                 'image_url': image_url,
                 'contact_name': '',
                 'phone': '',
-                'coordinates_lat': self._geocode_location(location),
-                'coordinates_lng': self._geocode_location_lng(location),
+                'coordinates_lat': coordinates[0] if coordinates else None,
+                'coordinates_lng': coordinates[1] if coordinates else None,
                 'images': images,
                 'similar_listings': [],
                 'scraped_at': datetime.now().isoformat(),
                 'is_knocked_down': is_knocked_down,
+                'auction_status': auction_status,
                 'date_from': date_from,
                 'date_to': date_to,
+                # dataset-only extras (database.py stores the columns above)
+                'appraised_price': appraisal,
+                'minimum_bid': minimum_bid,
+                'minimum_increment': minimum_increment,
+                'deposit': deposit,
+                'auction_kind': kind,
+                'geocoded_place': geocoded_place,
             }
             
         except Exception as e:
+            # A dropped auction would look sold to the web app, so the run is incomplete.
             Actor.log.warning(f"⚠️ Error converting auction data: {e}")
+            self.incomplete_reasons.append(f"could not convert auction {auction_id}: {e!r}")
             return None
 
 
@@ -404,12 +728,12 @@ async def main():
         # Get input parameters
         input_data = await Actor.get_input() or {}
         
-        max_listings = input_data.get('maxListings', 0)
-        auction_status = input_data.get('auctionStatus', 'active')
-        price_min = input_data.get('priceMin', 0)
-        price_max = input_data.get('priceMax', 0)
-        location = input_data.get('location', '')
-        search_query = input_data.get('searchQuery', '')
+        max_listings = input_data.get('maxListings') or 0
+        auction_status = OptimizedGovernmentAuctionScraper.normalise_status(input_data.get('auctionStatus'))
+        price_min = input_data.get('priceMin') or 0
+        price_max = input_data.get('priceMax') or 0
+        location = input_data.get('location') or ''
+        search_query = input_data.get('searchQuery') or ''
         
         Actor.log.info(f"📋 Configuration:")
         Actor.log.info(f"   Max listings: {max_listings if max_listings > 0 else 'unlimited'}")
@@ -476,6 +800,12 @@ async def main():
             
             incomplete_reasons = list(scraper.incomplete_reasons)
             saved = 0  # rows actually inserted into the database
+            # The map's database holds live auctions only (upcoming or running, not
+            # knocked down); ended ones go to the Apify dataset alone.
+            db_auctions = [
+                auction for auction in all_auctions
+                if auction.get('auction_status') in _LIVE_STATUSES and not auction.get('is_knocked_down', True)
+            ]
 
             # Save data to both Apify dataset and database
             if all_auctions:
@@ -483,36 +813,37 @@ async def main():
                 await Actor.push_data(all_auctions)
                 Actor.log.info(f"💾 Saved {len(all_auctions)} auctions to Apify dataset")
                 
-                # Save to database if available (only active auctions)
+                # Save to database if available (only live auctions)
                 if db_manager_available:
                     try:
-                        # Filter for database: only include active auctions (is_knocked_down: false)
-                        db_auctions = [auction for auction in all_auctions if not auction.get('is_knocked_down', True)]
-                        Actor.log.info(f"🔍 Filtering for database: {len(db_auctions)} active auctions out of {len(all_auctions)} total")
+                        Actor.log.info(f"🔍 Filtering for database: {len(db_auctions)} live auctions out of {len(all_auctions)} total")
                         
                         if db_auctions:
-                            Actor.log.info("💾 Saving active auctions to database...")
+                            Actor.log.info("💾 Saving live auctions to database...")
                             db_manager.insert_listings(db_auctions)
                             saved = len(db_auctions)
-                            Actor.log.info(f"✅ Saved {len(db_auctions)} active listings to database")
+                            Actor.log.info(f"✅ Saved {len(db_auctions)} live listings to database")
                         else:
-                            Actor.log.info("ℹ️ No active auctions to save to database")
+                            Actor.log.info("ℹ️ No live auctions to save to database")
                     except Exception as e:
                         Actor.log.error(f"❌ Failed to save listings to database: {e}")
                         # Try to refresh the connection pool and retry once
                         try:
                             Actor.log.info("🔄 Attempting to refresh connection pool and retry database operation")
                             db_manager.refresh_pool()
-                            db_auctions = [auction for auction in all_auctions if not auction.get('is_knocked_down', True)]
                             if db_auctions:
                                 db_manager.insert_listings(db_auctions)
                                 saved = len(db_auctions)
-                                Actor.log.info(f"✅ Successfully saved {len(db_auctions)} active listings to database after retry")
+                                Actor.log.info(f"✅ Successfully saved {len(db_auctions)} live listings to database after retry")
                         except Exception as retry_e:
                             Actor.log.error(f"❌ Failed to save listings to database even after retry: {retry_e}")
                             incomplete_reasons.append(f"database insert failed: {retry_e!r}")
             else:
                 Actor.log.warning("⚠️ No auctions found matching the specified criteria")
+
+            if auction_status == 'ended' and db_manager_available:
+                Actor.log.warning("auctionStatus 'ended' fills the Apify dataset only — the database keeps "
+                                  "live auctions — so the database run is closed as 'failed' (sold-detection ignores it)")
             
             # Zero auctions almost always means upstream breakage (API change,
             # auth/session failure) rather than an empty market — mark the run
@@ -547,7 +878,7 @@ async def main():
                 Actor.log.warning("⚠️ SCRAPING FINISHED — run status: failed")
             Actor.log.info(f"📊 Total auctions scraped: {len(all_auctions)}")
             if saved:
-                Actor.log.info(f"💾 Data saved to: Apify dataset ({len(all_auctions)} auctions) and database ({saved} active auctions)")
+                Actor.log.info(f"💾 Data saved to: Apify dataset ({len(all_auctions)} auctions) and database ({saved} live auctions)")
             else:
                 Actor.log.info(f"💾 Data saved to: {'Apify dataset only' if all_auctions else 'nowhere'}")
             Actor.log.info("=" * 60)
